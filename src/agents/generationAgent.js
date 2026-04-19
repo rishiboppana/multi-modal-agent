@@ -1,15 +1,21 @@
 // MODULE 3 — Image Generation Agent (OpenAI DALL-E 3)
 // Requirement 3.3: generate image · stylization mode · log config
-// Input:  apiKey + refinedPrompt (from Agent 2)
+// Input:  apiKey + refinedPrompt (from Agent 2) + promptMode (targeted_edit | full_transformation)
 // Output: { imageUrl, prompt, model, quality, style, size, mode }
 
-export async function runGenerationAgent(apiKey, refinedPrompt) {
+export async function runGenerationAgent(apiKey, refinedPrompt, promptMode = 'full_transformation') {
+  // natural = literal/faithful rendering (targeted edits, photo enhancement)
+  // vivid   = creative interpretation (style transformations, analysis visualizations)
+  const dalleStyle = (promptMode === 'targeted_edit' || promptMode === 'photo_enhancement')
+    ? 'natural'
+    : 'vivid';
+
   const config = {
     model: 'dall-e-3',
     quality: 'standard',
-    style: 'vivid',
+    style: dalleStyle,
     size: '1024x1024',
-    mode: 'stylization',
+    mode: promptMode,
   };
 
   const res = await fetch('https://api.openai.com/v1/images/generations', {

@@ -7,6 +7,7 @@ import { OPENAI_MODEL }        from './agents/api.js';
 import { runVisionAgent }      from './agents/visionAgent.js';
 import { runPromptAgent }      from './agents/promptAgent.js';
 import { runGenerationAgent }  from './agents/generationAgent.js';
+import { runSimilarityAgent }  from './agents/similarityAgent.js';
 import { runCritiqueAgent }    from './agents/critiqueAgent.js';
 
 // ─── UI Primitives ────────────────────────────────────────────────────────────
@@ -111,12 +112,13 @@ function Tag({ text }) {
 
 function WorkflowDiagram({ stage }) {
   const steps = [
-    { key: 'vision',     label: 'Vision\nAgent',     num: '01' },
-    { key: 'prompt',     label: 'Prompt\nEngineer',  num: '02' },
-    { key: 'generation', label: 'Image\nGenerator',  num: '03' },
-    { key: 'critique',   label: 'Critique\nAgent',   num: '04' },
+    { key: 'vision',     label: 'Vision\nAgent',      num: '01' },
+    { key: 'prompt',     label: 'Prompt\nEngineer',   num: '02' },
+    { key: 'generation', label: 'Image\nGenerator',   num: '03' },
+    { key: 'similarity', label: 'Similarity\nCheck',  num: '01b' },
+    { key: 'critique',   label: 'Critique\nAgent',    num: '04' },
   ];
-  const order = ['idle', 'vision', 'prompt', 'generation', 'critique', 'done'];
+  const order = ['idle', 'vision', 'prompt', 'generation', 'similarity', 'critique', 'done'];
   const ci    = order.indexOf(stage);
 
   return (
@@ -161,15 +163,15 @@ function WorkflowDiagram({ stage }) {
 const PRESETS = [
   {
     label: 'Use Case A — Captioning & VQA',
-    instruction: 'Generate a detailed caption for this image and answer key visual questions about the subject, environment, and mood.',
+    instruction: 'Analyze and visually represent this image in full detail: identify every key object, describe the scene composition, and create a rich detailed illustration that captures the subject, environment, mood, colors, textures, and spatial relationships exactly as seen.',
   },
   {
     label: 'Use Case B — Style-Guided Transformation',
-    instruction: 'Transform this image into a watercolor painting with soft brushstrokes and a painterly aesthetic.',
+    instruction: 'Transform this image into a professional watercolor painting — apply wet-on-wet brushstroke technique, soft color bleeding at edges, visible paper grain texture, translucent color washes, a warm painterly palette, and loose gestural marks. Preserve the original subject identity, pose, and composition throughout the transformation.',
   },
   {
     label: 'Use Case C — Prompt-Based Enhancement',
-    instruction: 'Enhance this as a professional studio-quality photo with balanced lighting, sharp details, and cinematic composition.',
+    instruction: 'Enhance this image as a professional studio-quality photograph — apply sharp focus, three-point studio lighting with balanced key and fill lights, cinematic depth of field with soft bokeh, rich color grading, high dynamic range, and RAW-quality post-processing. Keep the exact same subject, pose, and framing.',
   },
 ];
 
@@ -185,14 +187,19 @@ export default function App() {
   const [imagePreview, setImagePreview] = useState(null);
   const [instruction,  setInstruction]  = useState('');
 
-  // stage: idle | quality-check | vision | prompt | generation | critique | done
-  const [stage,          setStage]          = useState('idle');
-  const [errors,         setErrors]         = useState({});
-  const [visionResult,   setVisionResult]   = useState(null);
-  const [promptResult,   setPromptResult]   = useState(null);
-  const [genResult,      setGenResult]      = useState(null);
-  const [critiqueResult, setCritiqueResult] = useState(null);
-  const [rubricsHistory, setRubricsHistory] = useState([]);
+  // stage: idle | quality-check | vision | prompt | generation | similarity | critique | done
+  const [stage,            setStage]            = useState('idle');
+  const [errors,           setErrors]           = useState({});
+  const [visionResult,     setVisionResult]     = useState(null);
+  const [promptResult,     setPromptResult]     = useState(null);
+  const [genResult,        setGenResult]        = useState(null);
+  const [similarityResult, setSimilarityResult] = useState(null);
+  const [critiqueResult,   setCritiqueResult]   = useState(null);
+  const [rubricsHistory,   setRubricsHistory]   = useState([]);
+
+  // Loop orchestrator state
+  const [loopInfo,      setLoopInfo]      = useState(null); // { attempt, maxAttempts, weakAgent, agentFeedback }
+  const [iterationLog,  setIterationLog]  = useState([]);   // per-attempt history
 
   // Failure handling: quality warning gate
   const [qualityWarning,    setQualityWarning]    = useState(null);
@@ -201,7 +208,7 @@ export default function App() {
   const fileRef = useRef();
 
   function agentStatus(agentStage) {
-    const order = ['vision', 'prompt', 'generation', 'critique'];
+    const order = ['vision', 'prompt', 'generation', 'similarity', 'critique'];
     const ci = order.indexOf(stage);
     const ai = order.indexOf(agentStage);
     if (stage === 'idle' || stage === 'quality-check') return 'idle';
@@ -231,79 +238,201 @@ export default function App() {
     setErrors(err => ({ ...err, upload: null }));
     // Clear previous results when a new image is uploaded
     setVisionResult(null); setPromptResult(null);
-    setGenResult(null);    setCritiqueResult(null);
+    setGenResult(null);    setSimilarityResult(null);
+    setCritiqueResult(null);
     setQualityWarning(null);
+    setLoopInfo(null);
+    setIterationLog([]);
   }
 
   // Continue pipeline after user acknowledges quality warning
   async function continueAfterWarning() {
     setQualityWarning(null);
-    setStage('prompt');
     await runFromPromptStage(pendingVisionData);
   }
 
-  async function runFromPromptStage(vision) {
-    // Agent 2 — Prompt Engineering
-    // INPUT: userInstruction + vision output from Agent 1
-    let promptRes;
-    try {
-      promptRes = await runPromptAgent(apiKey, instruction, vision);
-      setPromptResult(promptRes);
-      // Failure: ambiguous instruction
-      if (promptRes.ambiguity_flag) {
-        setErrors(e => ({ ...e, prompt: promptRes.ambiguity_flag }));
+  // ── Loop Orchestrator ────────────────────────────────────────────────────────
+  // Runs up to MAX_ITERATIONS. Each cycle the critique agent diagnoses which
+  // upstream agent produced the weakest output and routes targeted feedback to
+  // that agent specifically so each retry fixes the right problem.
+  async function runFromPromptStage(initialVision) {
+    const MAX_ITERATIONS = 5;
+    let currentVision        = initialVision;
+    let visionFeedback       = null;
+    let promptHint           = null;
+    let consecutiveGenBlame  = 0;    // tracks how many times in a row generation was blamed
+    let prevMinScore         = -1;   // tracks whether scores improved or regressed
+    let bestGen              = null; // best result seen so far (highest min score across three dims)
+    let bestCritique         = null;
+
+    setIterationLog([]);
+    setLoopInfo({ attempt: 1, maxAttempts: MAX_ITERATIONS, weakAgent: null, agentFeedback: null });
+
+    for (let attempt = 1; attempt <= MAX_ITERATIONS; attempt++) {
+      // ── Re-run Vision if it was identified as the weak agent ─────────────────
+      if (visionFeedback) {
+        setStage('vision');
+        try {
+          currentVision = await runVisionAgent(apiKey, imageBase64, imageMime, visionFeedback);
+          setVisionResult(currentVision);
+        } catch (err) {
+          setErrors(e => ({ ...e, vision: `Vision agent failed: ${err.message}` }));
+          setStage('idle');
+          return;
+        }
+        visionFeedback = null;
+      }
+
+      // ── Agent 2 — Prompt Engineering ─────────────────────────────────────────
+      setStage('prompt');
+      let promptRes;
+      try {
+        promptRes = await runPromptAgent(apiKey, instruction, currentVision, promptHint);
+        setPromptResult(promptRes);
+        if (promptRes.ambiguity_flag) {
+          setErrors(e => ({ ...e, prompt: promptRes.ambiguity_flag }));
+          setStage('idle');
+          return;
+        }
+      } catch (err) {
+        setErrors(e => ({ ...e, prompt: `Prompt agent failed: ${err.message}` }));
         setStage('idle');
         return;
       }
-    } catch (err) {
-      setErrors(e => ({ ...e, prompt: `Prompt agent failed: ${err.message}` }));
-      setStage('idle');
-      return;
+
+      // ── Agent 3 — Image Generation ────────────────────────────────────────────
+      setStage('generation');
+      let gen;
+      try {
+        gen = await runGenerationAgent(apiKey, promptRes.refined_prompt, promptRes.mode);
+        setGenResult(gen);
+      } catch (err) {
+        setErrors(e => ({
+          ...e,
+          generation: `${err.message}. Refined prompt: "${promptRes.refined_prompt}"`,
+        }));
+        setStage('idle');
+        return;
+      }
+
+      // ── Agent 1b — Vision Similarity Check ───────────────────────────────────
+      // Re-analyzes the generated image and compares it field-by-field against
+      // the original vision analysis to produce precise mismatch data.
+      setStage('similarity');
+      let similarity = null;
+      try {
+        similarity = await runSimilarityAgent(apiKey, currentVision, gen.imageUrl);
+        setSimilarityResult(similarity);
+      } catch (err) {
+        // Non-fatal — continue without similarity data
+        setSimilarityResult(null);
+      }
+
+      // ── Agent 4 — Critique & Evaluation ──────────────────────────────────────
+      setStage('critique');
+      let critique;
+      try {
+        critique = await runCritiqueAgent(
+          apiKey, imageBase64, imageMime, gen.imageUrl, promptRes.refined_prompt, promptRes.mode, similarity
+        );
+
+        // Keep the best-scoring result across all attempts so the UI always
+        // shows the best output even if a later attempt regresses.
+        const minScore = Math.min(
+          critique.visual_relevance,
+          critique.prompt_faithfulness,
+          critique.transformation_quality
+        );
+        if (minScore > prevMinScore) {
+          prevMinScore = minScore;
+          bestGen      = gen;
+          bestCritique = critique;
+        }
+        // Always display best result seen so far
+        setGenResult(bestGen);
+        setCritiqueResult(bestCritique);
+
+        setIterationLog(log => [
+          ...log,
+          {
+            attempt,
+            weakAgent:     critique.weak_agent    ?? null,
+            agentFeedback: critique.agent_feedback ?? null,
+            scores: {
+              visual_relevance:       critique.visual_relevance,
+              prompt_faithfulness:    critique.prompt_faithfulness,
+              transformation_quality: critique.transformation_quality,
+              clip:                   critique.clip_similarity_estimate,
+            },
+            verdict:             critique.verdict,
+            revision_suggestion: critique.revision_suggestion ?? null,
+            isBest:              minScore === prevMinScore,
+          },
+        ]);
+
+        setRubricsHistory(h => [
+          ...h,
+          {
+            n:                      h.length + 1,
+            instruction:            instruction.slice(0, 45) + (instruction.length > 45 ? '…' : ''),
+            visual_relevance:       critique.visual_relevance,
+            prompt_faithfulness:    critique.prompt_faithfulness,
+            transformation_quality: critique.transformation_quality,
+            clip:                   (critique.clip_similarity_estimate * 100).toFixed(0) + '%',
+            verdict:                critique.verdict,
+          },
+        ]);
+      } catch (err) {
+        setErrors(e => ({ ...e, critique: `Critique agent failed: ${err.message}` }));
+        setStage('idle');
+        return;
+      }
+
+      if (bestCritique.verdict === 'ACCEPT' || attempt >= MAX_ITERATIONS) break;
+
+      // ── Smart weak-agent routing ──────────────────────────────────────────────
+      let weakAgent    = critique.weak_agent    ?? 'prompt';
+      let agentFeedback = critique.agent_feedback ?? critique.revision_suggestion ?? '';
+
+      // If generation is blamed 2+ times in a row the real problem is the prompt
+      // being too complex. Force a prompt simplification instead of adding detail.
+      if (weakAgent === 'generation') {
+        consecutiveGenBlame++;
+        if (consecutiveGenBlame >= 2) {
+          weakAgent     = 'prompt';
+          agentFeedback = `The previous prompt was too long and complex — DALL-E ignored key details. Rewrite the prompt as 2 short sentences only. Sentence 1: art style + composition guard ("single character, centered, no duplicates"). Sentence 2: one specific requested change. Drop all other detail. ${agentFeedback}`;
+          consecutiveGenBlame = 0;
+        }
+      } else {
+        consecutiveGenBlame = 0;
+      }
+
+      setLoopInfo({
+        attempt: attempt + 1,
+        maxAttempts: MAX_ITERATIONS,
+        weakAgent,
+        agentFeedback,
+      });
+
+      if (weakAgent === 'vision') {
+        visionFeedback = agentFeedback;
+        promptHint     = null;
+      } else {
+        visionFeedback = null;
+        // Prepend concrete similarity mismatches so the prompt agent has named
+        // field-level diffs, not just a vague revision suggestion.
+        const mismatchContext = similarity?.mismatches?.length
+          ? `Similarity check found these specific mismatches: ${similarity.mismatches.join(' | ')}. `
+          : '';
+        promptHint = mismatchContext + agentFeedback;
+      }
     }
 
-    // Agent 3 — Image Generation
-    // INPUT: refined_prompt from Agent 2
-    setStage('generation');
-    let gen;
-    try {
-      gen = await runGenerationAgent(apiKey, promptRes.refined_prompt);
-      setGenResult(gen);
-    } catch (err) {
-      // Failure: generation error — show refined prompt so user can retry manually
-      setErrors(e => ({
-        ...e,
-        generation: `${err.message}. Refined prompt for manual retry: "${promptRes.refined_prompt}"`,
-      }));
-      setStage('idle');
-      return;
-    }
+    // Ensure UI shows the best result, not the last one
+    if (bestGen)      setGenResult(bestGen);
+    if (bestCritique) setCritiqueResult(bestCritique);
 
-    // Agent 4 — Critique & Evaluation
-    // INPUT: original image + generated image URL + refined prompt
-    setStage('critique');
-    try {
-      const critique = await runCritiqueAgent(
-        apiKey, imageBase64, imageMime, gen.imageUrl, promptRes.refined_prompt
-      );
-      setCritiqueResult(critique);
-      setRubricsHistory(h => [
-        ...h,
-        {
-          n:                      h.length + 1,
-          instruction:            instruction.slice(0, 45) + (instruction.length > 45 ? '…' : ''),
-          visual_relevance:       critique.visual_relevance,
-          prompt_faithfulness:    critique.prompt_faithfulness,
-          transformation_quality: critique.transformation_quality,
-          clip:                   (critique.clip_similarity_estimate * 100).toFixed(0) + '%',
-          verdict:                critique.verdict,
-        },
-      ]);
-    } catch (err) {
-      setErrors(e => ({ ...e, critique: `Critique agent failed: ${err.message}` }));
-      setStage('idle');
-      return;
-    }
-
+    setLoopInfo(prev => ({ ...prev, weakAgent: null, agentFeedback: null }));
     setStage('done');
   }
 
@@ -316,8 +445,11 @@ export default function App() {
 
     setErrors({});
     setVisionResult(null); setPromptResult(null);
-    setGenResult(null);    setCritiqueResult(null);
+    setGenResult(null);    setSimilarityResult(null);
+    setCritiqueResult(null);
     setQualityWarning(null);
+    setLoopInfo(null);
+    setIterationLog([]);
 
     // Agent 1 — Vision Understanding
     // INPUT: raw image (base64)
@@ -444,6 +576,44 @@ export default function App() {
             {errors.pipeline && <ErrorBox message={errors.pipeline} />}
           </div>
         </div>
+
+        {/* ── Loop Orchestrator Progress Banner ───────────────────────────────── */}
+        {loopInfo && loopInfo.attempt > 1 && stage !== 'idle' && (
+          <div className="border border-zinc-600 rounded-lg bg-zinc-900 px-5 py-4">
+            <div className="flex items-center justify-between mb-3">
+              <Label>Loop Orchestrator — Auto-Revision in Progress</Label>
+              <span className="text-xs font-mono text-zinc-400">
+                Attempt {loopInfo.attempt} / {loopInfo.maxAttempts}
+              </span>
+            </div>
+            <div className="flex gap-1 mb-3">
+              {Array.from({ length: loopInfo.maxAttempts }).map((_, i) => (
+                <div
+                  key={i}
+                  className={`flex-1 h-1.5 rounded-full ${
+                    i < loopInfo.attempt - 1 ? 'bg-zinc-400'
+                    : i === loopInfo.attempt - 1 ? 'bg-white animate-pulse'
+                    : 'bg-zinc-800'
+                  }`}
+                />
+              ))}
+            </div>
+            {loopInfo.weakAgent && (
+              <div className="flex items-start gap-3">
+                <span className={`text-xs font-mono font-bold px-2 py-1 rounded border shrink-0 ${
+                  loopInfo.weakAgent === 'vision'     ? 'border-zinc-400 text-zinc-200' :
+                  loopInfo.weakAgent === 'prompt'     ? 'border-zinc-400 text-zinc-200' :
+                                                        'border-zinc-400 text-zinc-200'
+                }`}>
+                  {loopInfo.weakAgent === 'vision'     ? 'Agent 01 — Vision'
+                  : loopInfo.weakAgent === 'prompt'    ? 'Agent 02 — Prompt'
+                                                       : 'Agent 03 — Generation'}
+                </span>
+                <p className="text-xs text-zinc-400 leading-relaxed">{loopInfo.agentFeedback}</p>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Failure Handling — Quality Warning Gate (Req 3.5.5) */}
         {qualityWarning && (
@@ -576,10 +746,96 @@ export default function App() {
                   <img src={genResult.imageUrl} alt="AI Generated" className="rounded max-h-96" />
                 </div>
               </div>
-              <InfoBox label="OUTPUT →" message="imageUrl — passed to Agent 04 for critique" />
+              <InfoBox label="OUTPUT →" message="imageUrl — passed to Agent 01b (Similarity Check) and Agent 04 (Critique)" />
             </div>
           ) : (
             <p className="text-zinc-600 text-sm">Waiting for Agent 02 to complete.</p>
+          )}
+        </AgentPanel>
+
+        {/* ── Agent 01b — Vision Similarity Check ──────────────────────────────── */}
+        <AgentPanel number="01b" title="Vision Similarity Agent — Fidelity Check" status={agentStatus('similarity')}>
+          {agentStatus('similarity') === 'running' && <Spinner message="Re-analyzing generated image and comparing to original…" />}
+          {similarityResult ? (
+            <div className="space-y-4">
+              <InfoBox label="INPUT →" message="Original vision analysis (Agent 01) + Generated image URL (Agent 03)" />
+
+              {/* Fidelity verdict + overall score */}
+              <div className="flex items-center gap-4">
+                <div className={`border rounded px-4 py-3 text-center font-bold font-mono text-sm ${
+                  similarityResult.fidelity_verdict === 'HIGH'   ? 'border-white bg-white text-black' :
+                  similarityResult.fidelity_verdict === 'MEDIUM' ? 'border-zinc-400 text-zinc-200' :
+                                                                    'border-zinc-600 text-zinc-500'
+                }`}>
+                  {similarityResult.fidelity_verdict === 'HIGH' ? '✓ HIGH' :
+                   similarityResult.fidelity_verdict === 'MEDIUM' ? '~ MEDIUM' : '✗ LOW'} FIDELITY
+                </div>
+                <div className="text-xs text-zinc-400 font-mono">
+                  Overall fidelity score: <span className="text-white font-bold">{similarityResult.overall_fidelity_score}/10</span>
+                </div>
+              </div>
+
+              {/* Per-field similarity bars */}
+              <div>
+                <Label>Field-by-Field Similarity (Vision Agent 01 vs Generated Image)</Label>
+                {[
+                  { label: 'Art Style Match',       value: similarityResult.similarity_scores?.art_style_match },
+                  { label: 'Subject Identity',      value: similarityResult.similarity_scores?.subject_identity_match },
+                  { label: 'Clothing Details',      value: similarityResult.similarity_scores?.clothing_details_match },
+                  { label: 'Color Accuracy',        value: similarityResult.similarity_scores?.color_accuracy_match },
+                  { label: 'Pose Match',            value: similarityResult.similarity_scores?.pose_match },
+                  { label: 'Composition',           value: similarityResult.similarity_scores?.composition_match },
+                ].map(({ label, value }) => value != null && (
+                  <ScoreBar key={label} label={label} value={value} />
+                ))}
+              </div>
+
+              {/* Matches & Mismatches */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {similarityResult.matches?.length > 0 && (
+                  <div>
+                    <Label>Confirmed Matches</Label>
+                    <ul className="space-y-1">
+                      {similarityResult.matches.map((m, i) => (
+                        <li key={i} className="text-xs text-zinc-300 flex gap-2">
+                          <span className="text-zinc-500 shrink-0">✓</span>{m}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {similarityResult.mismatches?.length > 0 && (
+                  <div>
+                    <Label>Detected Mismatches</Label>
+                    <ul className="space-y-1">
+                      {similarityResult.mismatches.map((m, i) => (
+                        <li key={i} className="text-xs text-zinc-400 flex gap-2">
+                          <span className="text-zinc-600 shrink-0">✗</span>{m}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+
+              {/* Prompt fix suggestions */}
+              {similarityResult.prompt_fix_suggestions?.length > 0 && (
+                <div>
+                  <Label>Prompt Fix Suggestions (routed to Agent 02 on retry)</Label>
+                  <ul className="space-y-1">
+                    {similarityResult.prompt_fix_suggestions.map((s, i) => (
+                      <li key={i} className="text-xs text-zinc-400 flex gap-2">
+                        <span className="text-zinc-600 shrink-0 font-mono">→</span>{s}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <InfoBox label="OUTPUT →" message="Similarity scores + mismatches → passed to Agent 04 (Critique) and Agent 02 (Prompt) on retry" />
+            </div>
+          ) : (
+            <p className="text-zinc-600 text-sm">Waiting for Agent 03 to complete.</p>
           )}
         </AgentPanel>
 
@@ -590,7 +846,7 @@ export default function App() {
           {errors.critique && <ErrorBox message={errors.critique} />}
           {critiqueResult ? (
             <div className="space-y-5">
-              <InfoBox label="INPUT →" message="Original image + Generated image + refined_prompt from Agent 02" />
+              <InfoBox label="INPUT →" message="Original image + Generated image + refined_prompt (Agent 02) + similarity scores (Agent 01b)" />
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {/* Scores */}
@@ -700,6 +956,77 @@ export default function App() {
             </div>
           </div>
         )}
+        {/* ── Loop Orchestrator Iteration Log ─────────────────────────────────── */}
+        {iterationLog.length > 0 && (
+          <div className="border border-zinc-800 rounded-lg bg-zinc-950 p-5">
+            <Label>
+              Loop Orchestrator — Iteration History ({iterationLog.length} attempt{iterationLog.length > 1 ? 's' : ''})
+              {iterationLog[iterationLog.length - 1]?.verdict === 'ACCEPT' ? ' ✓ Converged' : ''}
+            </Label>
+            <div className="space-y-3 mt-1">
+              {iterationLog.map((entry) => (
+                <div
+                  key={entry.attempt}
+                  className={`border rounded px-4 py-3 ${
+                    entry.verdict === 'ACCEPT' ? 'border-white bg-zinc-900'
+                    : entry.isBest ? 'border-zinc-400 bg-zinc-900'
+                    : 'border-zinc-800 bg-zinc-950'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-mono font-bold text-zinc-300">
+                        Attempt {entry.attempt}
+                      </span>
+                      {entry.isBest && entry.verdict !== 'ACCEPT' && (
+                        <span className="text-xs font-mono text-zinc-400 border border-zinc-600 px-1.5 py-0.5 rounded">
+                          best so far
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {entry.weakAgent && entry.verdict !== 'ACCEPT' && (
+                        <span className="text-xs font-mono border border-zinc-600 text-zinc-400 px-2 py-0.5 rounded">
+                          Improving: {entry.weakAgent === 'vision' ? 'Agent 01 Vision' : entry.weakAgent === 'prompt' ? 'Agent 02 Prompt' : 'Agent 03 Generation'}
+                        </span>
+                      )}
+                      <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded ${
+                        entry.verdict === 'ACCEPT' ? 'bg-white text-black' : 'border border-zinc-600 text-zinc-300'
+                      }`}>
+                        {entry.verdict === 'ACCEPT' ? '✓ ACCEPT' : '✗ REVISE'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-4 gap-2 text-xs font-mono mb-2">
+                    {[
+                      { label: 'Visual',       value: entry.scores.visual_relevance,       max: 10 },
+                      { label: 'Faithfulness', value: entry.scores.prompt_faithfulness,    max: 10 },
+                      { label: 'Quality',      value: entry.scores.transformation_quality, max: 10 },
+                      { label: 'CLIP',         value: (entry.scores.clip * 100).toFixed(0) + '%', raw: true },
+                    ].map(({ label, value, max, raw }) => (
+                      <div key={label} className="text-center">
+                        <p className="text-zinc-500">{label}</p>
+                        <p className={`font-bold ${
+                          raw
+                            ? 'text-zinc-200'
+                            : value >= 9 ? 'text-white' : value >= 8 ? 'text-zinc-300' : 'text-zinc-500'
+                        }`}>
+                          {raw ? value : `${value}/${max}`}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  {entry.agentFeedback && entry.verdict !== 'ACCEPT' && (
+                    <p className="text-xs text-zinc-500 leading-relaxed border-t border-zinc-800 pt-2 mt-1">
+                      <span className="text-zinc-400">Feedback → </span>{entry.agentFeedback}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
       </main>
 
       <footer className="border-t border-zinc-900 mt-8 py-4 text-center text-xs text-zinc-700 font-mono">
